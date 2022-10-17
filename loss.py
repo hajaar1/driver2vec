@@ -1,68 +1,72 @@
-# Full architecture
+# Hard Triplet Loss
 
-# The following class implements the full architecture of Driver2Vec
+# The following class implements the hard triplet loss. Hard means that the closest negative and furthest positive are choosen instead of random.
 
+class HardTripletLoss():
 
-class Driver2Vec(nn.Module):
-    def __init__(
-            self,
-            input_size,
-            input_length,
-            num_channels,
-            output_size,
-            kernel_size,
-            dropout,
-            do_wavelet=True,
-            fc_output_size=15):
-        super(Driver2Vec, self).__init__()
+    def __init__(self, device, margin=1.0):
+        self.margin = margin
+        self.device = device
 
-        self.tcn = TemporalConvNet(input_size,
-                                   num_channels,
-                                   kernel_size=kernel_size,
-                                   dropout=dropout)
-        self.wavelet = do_wavelet
-        if self.wavelet:
-            self.haar = WaveletPart(
-                input_length, input_size*input_length//2, fc_output_size)
+    def _get_anchor_positive_triplet_mask(self, labels):
+        labels_mat = labels.unsqueeze(0).repeat(labels.shape[0], 1)
+        res = (labels_mat == labels_mat.T).int().to(self.device)
+        return res
 
-            linear_size = num_channels[-1] + fc_output_size*2
-        else:
-            linear_size = num_channels[-1]
-        self.input_length = input_length
+    def _get_anchor_negative_triplet_mask(self, labels):
+        labels_mat = labels.unsqueeze(0).repeat(labels.shape[0], 1)
+        res = (labels_mat != labels_mat.T).int().to(self.device)
+        return res
 
-        self.input_bn = nn.BatchNorm1d(linear_size)
-        self.linear = nn.Linear(linear_size, output_size)
-        self.activation = nn.Sigmoid()
+    def _get_dist_matrix(self, embeddings):
+        return torch.cdist(embeddings, embeddings).to(self.device)**2
 
-    def forward(self, inputs, print_temp=False):
-        """Inputs have to have dimension (N, C_in, L_in*2)
-        the base time series, and the two wavelet transform channel are concatenated along the third dim"""
+    def __call__(self, embeddings, labels):
+        """Build the triplet loss over a batch of embeddings.
 
-        # split the inputs, in the last dim, first is the unchanged data, then
-        # the wavelet transformed data
-        input_tcn, input_haar = torch.split(inputs, self.input_length, 2)
+        For each anchor, we get the hardest positive and hardest negative to form a triplet.
 
-        # feed each one to their corresponding network
-        y1 = self.tcn(input_tcn)
-        # for the TCN, only the last output element interests us
-        y1 = y1[:, :, -1]
+        Args:
+            labels: labels of the batch, of size (batch_size,)
+            embeddings: tensor of shape (batch_size, embed_dim)
 
-        if self.wavelet:
-            y2 = self.haar(input_haar)
+        Returns:
+            triplet_loss: scalar tensor containing the triplet loss
+        """
+        # Get the pairwise distance matrix
+        pairwise_dist = self._get_dist_matrix(embeddings)
 
-            out = torch.cat((y1, y2), 1)
-        else:
-            out = y1
-        # bsize = out.shape[0]
+        # For each anchor, get the hardest positive
+        # First, we need to get a mask for every valid positive (they should have same label)
+        mask_anchor_positive = self._get_anchor_positive_triplet_mask(labels)
 
-        # if bsize > 1:  # issue when the batch size is 1, can't batch normalize it
-        #     out = self.input_bn(out)
-        # else:
-        #     out = out
-        # out = self.linear(out)
-        out = self.activation(out)
+        # We put to 0 any element where (a, p) is not valid (valid if a != p and label(a) == label(p))
+        anchor_positive_dist = mask_anchor_positive * pairwise_dist
 
-        # if print_temp:
-        #     print(out)
+        # shape (batch_size, 1)
+        hardest_positive_dist, _ = torch.max(
+            anchor_positive_dist, axis=1, keepdims=True)
 
-        return out
+        # For each anchor, get the hardest negative
+        # First, we need to get a mask for every valid negative (they should have different labels)
+        mask_anchor_negative = self._get_anchor_negative_triplet_mask(labels)
+
+        # We add the maximum value in each row to the invalid negatives (label(a) == label(n))
+        max_anchor_negative_dist, _ = torch.max(
+            pairwise_dist, axis=1, keepdims=True)
+        anchor_negative_dist = pairwise_dist + \
+            max_anchor_negative_dist * (1.0 - mask_anchor_negative)
+
+        # shape (batch_size,)
+        hardest_negative_dist, _ = torch.min(
+            anchor_negative_dist, axis=1, keepdims=True)
+
+        # Combine biggest d(a, p) and smallest d(a, n) into final triplet loss
+        triplet_loss = torch.max(hardest_positive_dist -
+                                 hardest_negative_dist + self.margin, torch.zeros_like(hardest_negative_dist))
+
+        # Get final mean triplet loss
+        triplet_loss = torch.mean(triplet_loss)
+
+        return triplet_loss
+
