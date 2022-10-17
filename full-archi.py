@@ -2,7 +2,8 @@
 
 # The following class implements the full architecture of Driver2Vec
 
-
+from tcn.py import *
+from hwt.py import *
 class Driver2Vec(nn.Module):
     def __init__(
             self,
